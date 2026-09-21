@@ -10,19 +10,34 @@ import (
 )
 
 // Column widths of a log row, in terminal cells. The columns sit flush against
-// one another and are told apart by colour rather than by gaps. The clock and
-// duration cells are two cells wider than their value, which is the space asked
-// for on either side of them.
+// one another and are told apart by colour rather than by gaps.
 const (
 	colMark     = 2 // selection marker plus the space after it
 	colIndex    = 3
-	colTodo     = 6 // " TODO " or " DONE " with spaces
+	colTodo     = 3 // " T " or " D " compact, expands when focused
+	colSched    = 3 // " S " compact, expands when focused
+	colDead     = 3 // " D " compact, expands when focused
 	colTime     = 8
 	colDuration = 8
 	rowMargin   = 1
 
 	// fixedWidth is every cell left of the content column, marker included.
-	fixedWidth = colMark + colIndex + colTodo + colTime*2 + colDuration
+	// This is the minimum width when nothing is expanded.
+	fixedWidth = colMark + colIndex + colTodo + colTime*2 + colDuration + colSched + colDead
+)
+
+// expandedWidth is how wide a column gets when focused. The focused column
+// overlaps the content area to show its full detail.
+const (
+	expandedTodo = 6 // " TODO " or " DONE " (with space separators)
+	expandedDate = 21 // " S: 2026-09-21 09:30 " or " D: 2026-09-21 09:30 " (with space separators)
+)
+
+// expandableCells are reusable components for columns that can expand.
+var (
+	todoExpandable = NewExpandableCell(colTodo, expandedTodo)
+	schedExpandable = NewExpandableCell(colSched, expandedDate)
+	deadExpandable = NewExpandableCell(colDead, expandedDate)
 )
 
 // pal is the live palette: the shipped defaults until Apply reads the user's
@@ -112,6 +127,31 @@ func choose(active bool, yes, no lipgloss.TerminalColor) lipgloss.TerminalColor 
 		return yes
 	}
 	return no
+}
+
+// overlay paints overlay on top of base starting at column x.
+// Both strings are single-line. The overlay replaces characters in base,
+// preserving ANSI escapes by working on visible cells.
+func overlay(base, overlayStr string, x int) string {
+	if x < 0 || overlayStr == "" {
+		return base
+	}
+	baseWidth := lipgloss.Width(base)
+	overlayWidth := lipgloss.Width(overlayStr)
+
+	// If overlay starts past the base, just pad and append
+	if x >= baseWidth {
+		return base + strings.Repeat(" ", x-baseWidth) + overlayStr
+	}
+
+	// Split base into before, overlaid, and after sections
+	before := ansi.Truncate(base, x, "\x1b[0m")
+	rest := ansi.TruncateLeft(base, x, "")
+
+	// The overlay replaces the next overlayWidth cells of rest
+	after := ansi.TruncateLeft(rest, overlayWidth, "")
+
+	return before + overlayStr + after
 }
 
 // divider is a hairline rule between the page regions, drawn in the border

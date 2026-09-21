@@ -28,11 +28,13 @@ func (a *App) collectTodos() []todoEntry {
 	j := a.journal()
 	for _, day := range j.Days {
 		for i := range day.Items {
-			if day.Items[i].Todo == "TODO" {
+			item := &day.Items[i]
+			// Include items with TODO status, or with SCHEDULED/DEADLINE dates
+			if item.Todo == "TODO" || item.Scheduled != nil || item.Deadline != nil {
 				entries = append(entries, todoEntry{
 					date:  day.Date,
 					index: i,
-					item:  &day.Items[i],
+					item:  item,
 				})
 			}
 		}
@@ -166,13 +168,103 @@ func (a *App) renderTodoRow(i int, entry todoEntry) string {
 		content += "  :" + strings.Join(entry.item.Tags, ":") + ":"
 	}
 
+	// TODO status in first column (with spaces inside highlight + separator spaces outside)
+	todoWidth := 0
+	todoStr := ""
+	if entry.item.Todo != "" {
+		todoStr = entry.item.Todo
+		todoWidth = len(todoStr) + 4 // +2 for spaces inside highlight + +2 for separator spaces outside
+	}
+
+	// SCHEDULED/DEADLINE in last column (with spaces inside highlight + separator spaces outside)
+	var dateParts []string
+	if entry.item.Scheduled != nil {
+		dateParts = append(dateParts, "S:"+shortDate(entry.item.Scheduled.DateString()))
+	}
+	if entry.item.Deadline != nil {
+		dateParts = append(dateParts, "D:"+shortDate(entry.item.Deadline.DateString()))
+	}
+	dateStatus := strings.Join(dateParts, " ")
+	dateWidth := 0
+	if dateStatus != "" {
+		// Each part gets spaces inside highlight + separator spaces outside
+		dateWidth = len(dateStatus) + 4 // +2 for outer separator spaces + +2 for inner spaces
+		if len(dateParts) > 1 {
+			dateWidth += 2 // +2 for inner spaces between parts
+		}
+	}
+
+	contentWidth := a.width - rowMargin - 2 - todoWidth - 10 - 1 - dateWidth
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
+	// Build colored TODO string with background (including spaces) - same colors as log page
+	todoRendered := ""
+	if entry.item.Todo != "" {
+		if entry.item.Todo == "DONE" {
+			todoRendered = run(" ", fg(pal.Text), ground) +
+				lipgloss.NewStyle().
+					Foreground(fg(pal.Ink)).
+					Background(bg("#6aaa7a")).
+					Render(" "+entry.item.Todo+" ") +
+				run(" ", fg(pal.Text), ground)
+		} else {
+			todoRendered = run(" ", fg(pal.Text), ground) +
+				lipgloss.NewStyle().
+					Foreground(fg(pal.Ink)).
+					Background(bg("#5b8abf")).
+					Render(" "+entry.item.Todo+" ") +
+				run(" ", fg(pal.Text), ground)
+		}
+	}
+
+	// Build colored S/D string with backgrounds (including spaces) - same colors as log page
+	dateRendered := ""
+	if dateStatus != "" {
+		dateRendered = run(" ", fg(pal.Text), ground) + a.renderTodoDateStatus(entry.item, selected) + run(" ", fg(pal.Text), ground)
+	}
+
 	row := run(strings.Repeat(" ", rowMargin), fg(pal.Text), ground) +
 		run(marker, fg(pal.Warn), ground) +
+		todoRendered +
 		lipgloss.JoinHorizontal(lipgloss.Top,
 			cell(entry.date, 10, lipgloss.Left, dateFG, ground),
 			run(" ", fg(pal.Text), ground),
-			cell(content, a.width-rowMargin-2-10-1, lipgloss.Left, contentFG, ground),
-		)
+			cell(content, contentWidth, lipgloss.Left, contentFG, ground),
+		) +
+		dateRendered
 
 	return cut(row, a.width)
+}
+
+// shortDate converts "2026-09-21" to "09-21"
+func shortDate(date string) string {
+	if len(date) >= 10 {
+		return date[5:]
+	}
+	return date
+}
+
+// renderTodoDateStatus builds the colored S/D status string with backgrounds (including spaces) - same colors as log page
+func (a *App) renderTodoDateStatus(item *store.Item, selected bool) string {
+	var parts []string
+	if item.Scheduled != nil {
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(fg(pal.Ink)).
+			Background(bg(pal.Start)).
+			Render(" S:"+shortDate(item.Scheduled.DateString())+" "))
+	}
+	if item.Deadline != nil {
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(fg(pal.Ink)).
+			Background(bg(pal.Crossed)).
+			Render(" D:"+shortDate(item.Deadline.DateString())+" "))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
 }

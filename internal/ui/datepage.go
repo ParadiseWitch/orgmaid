@@ -23,11 +23,9 @@ type dateState struct {
 	searching bool
 	search    textinput.Model
 
-	// Calendar view
+	// Calendar view - now uses the Picker component
 	calMode   bool   // true = calendar view, false = list view
-	calYear   int    // displayed year
-	calMonth  int    // displayed month (1-12)
-	calCursor string // selected date in calendar mode
+	picker    *Picker
 }
 
 func newDateState() dateState {
@@ -37,11 +35,34 @@ func newDateState() dateState {
 }
 
 // reset rebuilds the list from the journal: every day that has a header, plus
-// today so the current date is always reachable.
+// today so the current date is always reachable. Also includes dates from
+// SCHEDULED and DEADLINE fields of items.
 func (d *dateState) reset(j store.Journal, current string) {
 	d.counts = make(map[string]int, len(j.Days)+1)
 	for _, day := range j.Days {
-		d.counts[day.Date] = len(day.Items)
+		// Ensure the day date exists in counts
+		if _, ok := d.counts[day.Date]; !ok {
+			d.counts[day.Date] = 0
+		}
+		// Count items by their SCHEDULED and DEADLINE dates
+		for _, item := range day.Items {
+			// Count the item on its day date
+			d.counts[day.Date]++
+			// Count the item on its SCHEDULED date (if different from day date)
+			if item.Scheduled != nil {
+				schedDate := item.Scheduled.DateString()
+				if schedDate != day.Date {
+					d.counts[schedDate]++
+				}
+			}
+			// Count the item on its DEADLINE date (if different from day date)
+			if item.Deadline != nil {
+				deadDate := item.Deadline.DateString()
+				if deadDate != day.Date {
+					d.counts[deadDate]++
+				}
+			}
+		}
 	}
 	today := store.Today()
 	if _, ok := d.counts[today]; !ok {
@@ -71,16 +92,12 @@ func (d *dateState) reset(j store.Journal, current string) {
 		}
 	}
 
-	// Initialize calendar to current date's month
-	if current != "" {
-		d.calYear, d.calMonth, _ = parseDateParts(current)
-	} else {
-		d.calYear, d.calMonth, _ = parseDateParts(today)
+	// Initialize the picker for calendar mode
+	target := current
+	if target == "" {
+		target = today
 	}
-	d.calCursor = current
-	if d.calCursor == "" {
-		d.calCursor = today
-	}
+	d.picker = NewPicker(target, PickDateOnly, d.counts)
 }
 
 func (a *App) updateDates(k tea.KeyMsg) tea.Cmd {
@@ -91,69 +108,37 @@ func (a *App) updateDates(k tea.KeyMsg) tea.Cmd {
 		return a.updateDateSearch(k)
 	}
 
-	// Calendar mode navigation
+	// Calendar mode navigation - delegate to picker
 	if d.calMode {
+		// Handle global keys first
 		if r, ok := keys.SingleRune(k); ok {
-			switch r {
-			case 'h':
-				d.moveCalendar(-1)
-				return nil
-			case 'l':
-				d.moveCalendar(1)
-				return nil
-			case 'j':
-				d.moveCalendar(7)
-				return nil
-			case 'k':
-				d.moveCalendar(-7)
-				return nil
-			case 'H':
-				d.moveCalendarMonth(-1)
-				return nil
-			case 'L':
-				d.moveCalendarMonth(1)
-				return nil
-			case 'K':
-				d.moveCalendarMonth(-1)
-				return nil
-			case 'J':
-				d.moveCalendarMonth(1)
-				return nil
-			case 's':
-				// Jump to today
-				today := store.Today()
-				d.calCursor = today
-				d.calYear, d.calMonth, _ = parseDateParts(today)
-				return nil
-			case 'q':
+			if r == 'q' {
 				return tea.Quit
-			case '?':
+			}
+			if r == '?' {
 				a.page = pageHelp
 				a.helpFrom = helpFromDate
 				return nil
-			case 'c':
-				a.enterDay(d.calCursor)
+			}
+			if r == 'c' {
+				a.enterDay(d.picker.SelectedDate())
 				return nil
 			}
 		}
+
+		handled, done := d.picker.Update(k)
+		if done {
+			a.enterDay(d.picker.SelectedDate())
+			return nil
+		}
+		if handled {
+			return nil
+		}
+
+		// Keys the picker didn't handle
 		switch k.Type {
 		case tea.KeyTab:
 			d.calMode = false
-			return nil
-		case tea.KeyLeft:
-			d.moveCalendar(-1)
-			return nil
-		case tea.KeyRight:
-			d.moveCalendar(1)
-			return nil
-		case tea.KeyDown:
-			d.moveCalendar(7)
-			return nil
-		case tea.KeyUp:
-			d.moveCalendar(-7)
-			return nil
-		case tea.KeyEnter:
-			a.enterDay(d.calCursor)
 			return nil
 		case tea.KeyEsc:
 			a.enterDay(a.date)
@@ -337,10 +322,13 @@ func (d *dateState) scrollSelectedIntoView(height int) {
 func (a *App) viewDates() string {
 	d := &a.dates
 
-	// Calendar view
+	// Calendar view - use the picker
 	if d.calMode {
+		d.picker.Init(a.width, a.height-4)
 		return lipgloss.JoinVertical(lipgloss.Left,
-			a.viewCalendar(),
+			spread(a.width, titleStyle.Render("\uf073 选择日期"), dimStyle.Render(a.dateCount())),
+			divider(a.width),
+			d.picker.View(),
 			divider(a.width),
 			a.renderDateStatus(),
 		)
@@ -429,7 +417,14 @@ func (a *App) renderDateStatus() string {
 
 	var hints string
 	if d.calMode {
-		hints = "日历 | h/l/←/→ 前后天 | j/k/↓/↑ 上下周 | H/L 上下月 | s 今天 | Tab 返回列表 | Enter 打开 | Esc 返回 | q 退出"
+		switch d.picker.Focus {
+		case FocusHour:
+			hints = "小时 | ↑↓ 加减 数字输入 s 现在 Tab 分钟 Esc 回日历 | q 退出"
+		case FocusMinute:
+			hints = "分钟 | ↑↓ 加减 数字输入 s 现在 Tab 日历 Esc 回日历 | q 退出"
+		default:
+			hints = "日历 | h/l/←/→ 前后天 | j/k/↓/↑ 上下周 | H/L 上下月 | s 今天 | Tab 返回列表 | Enter 打开 | Esc 返回 | q 退出"
+		}
 	} else {
 		hints = "列表 | j/k 选择 | h/l 翻页 | / 搜索 | Tab 切换日历 | Enter 打开 | Esc 返回 | ? 帮助 | q 退出"
 	}
@@ -491,133 +486,4 @@ func monthName(month int) string {
 		return names[month-1]
 	}
 	return ""
-}
-
-// hasEntry checks if a date has any entries
-func (d *dateState) hasEntry(date string) bool {
-	return d.counts[date] > 0
-}
-
-// viewCalendar renders the calendar view
-func (a *App) viewCalendar() string {
-	d := &a.dates
-	year, month := d.calYear, d.calMonth
-
-	// Calendar width: 7 days * 3 chars (2 digits + 1 space) = 21 chars
-	calWidth := 21
-	calLeft := (a.width - calWidth) / 2
-	if calLeft < 0 {
-		calLeft = 0
-	}
-	leftPad := strings.Repeat(" ", calLeft)
-
-	// Header with month/year - centered
-	header := titleStyle.Render(fmt.Sprintf("\uf073 %d年 %s", year, monthName(month)))
-	headerWidth := lipgloss.Width(header)
-	headerLeft := (a.width - headerWidth) / 2
-	if headerLeft < 0 {
-		headerLeft = 0
-	}
-	titleRow := strings.Repeat(" ", headerLeft) + header
-
-	// Weekday headers - centered
-	weekdays := "日 一 二 三 四 五 六"
-	weekdayRow := leftPad + dimStyle.Render(weekdays)
-
-	// Calculate calendar grid
-	firstDay := firstDayOfMonth(year, month)
-	totalDays := daysInMonth(year, month)
-
-	var rows []string
-	rows = append(rows, titleRow)
-	rows = append(rows, divider(a.width))
-	rows = append(rows, weekdayRow)
-
-	// Build weeks
-	day := 1
-	for week := 0; week < 6 && day <= totalDays; week++ {
-		var weekLine strings.Builder
-		weekLine.WriteString(leftPad)
-
-		for dow := 0; dow < 7; dow++ {
-			if (week == 0 && dow < firstDay) || day > totalDays {
-				weekLine.WriteString("   ")
-			} else {
-				dateStr := formatDate(year, month, day)
-				isToday := dateStr == store.Today()
-				isSelected := dateStr == d.calCursor
-				hasEntry := d.hasEntry(dateStr)
-
-				var style lipgloss.Style
-				var text string
-
-				if isSelected {
-					style = lipgloss.NewStyle().
-						Background(bg(pal.Field)).
-						Foreground(fg(pal.Ink)).
-						Bold(true)
-					text = fmt.Sprintf("%2d", day)
-				} else if isToday {
-					// Today: bold + underline
-					style = lipgloss.NewStyle().
-						Foreground(fg(pal.Warn)).
-						Bold(true).
-						Underline(true)
-					text = fmt.Sprintf("%2d", day)
-				} else if hasEntry {
-					// Has entries: use combining dot below (U+0323)
-					style = lipgloss.NewStyle().
-						Foreground(fg(pal.Start))
-					text = fmt.Sprintf("%2d\u0323", day)
-				} else {
-					style = lipgloss.NewStyle().
-						Foreground(fg(pal.Text))
-					text = fmt.Sprintf("%2d", day)
-				}
-
-				weekLine.WriteString(style.Render(text))
-				weekLine.WriteString(" ")
-				day++
-			}
-		}
-		rows = append(rows, weekLine.String())
-	}
-
-	// Fill remaining rows to maintain height
-	targetHeight := a.height - 4
-	for len(rows) < targetHeight {
-		rows = append(rows, "")
-	}
-
-	// Add info about selected date
-	if d.calCursor != "" {
-		count := d.counts[d.calCursor]
-		weekday := store.Weekday(d.calCursor)
-		info := fmt.Sprintf("%s %s | %d 项", d.calCursor, weekday, count)
-		if d.calCursor == store.Today() {
-			info += " (今天)"
-		}
-		rows = append(rows, divider(a.width))
-		rows = append(rows, cell(info, a.width, lipgloss.Center, fg(pal.Dim), transparent))
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, rows...)
-}
-
-// moveCalendar moves the calendar cursor by delta days
-func (d *dateState) moveCalendar(deltaDays int) {
-	t, _ := time.Parse("2006-01-02", d.calCursor)
-	t = t.AddDate(0, 0, deltaDays)
-	d.calCursor = t.Format("2006-01-02")
-	d.calYear = t.Year()
-	d.calMonth = int(t.Month())
-}
-
-// moveCalendarMonth moves the calendar by months
-func (d *dateState) moveCalendarMonth(deltaMonths int) {
-	t, _ := time.Parse("2006-01-02", d.calCursor)
-	t = t.AddDate(0, deltaMonths, 0)
-	d.calCursor = t.Format("2006-01-02")
-	d.calYear = t.Year()
-	d.calMonth = int(t.Month())
 }

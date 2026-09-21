@@ -8,24 +8,26 @@ import (
 func TestAddDurationWritesTheEndTime(t *testing.T) {
 	cases := []struct {
 		name        string
-		start       string
+		startDate   string
+		startH      int
 		minutes     int
-		wantEnd     string
+		wantEndDate string
+		wantEndH    int
+		wantEndM    int
 		wantDur     time.Duration
-		wantCrossed bool
 	}{
-		{"a plain span", "09:00", 70, "10:10", 70 * time.Minute, false},
-		{"no span at all", "09:00", 0, "09:00", 0, false},
-		{"up to midnight", "23:00", 60, "00:00", time.Hour, true},
-		{"past midnight", "23:00", 120, "01:00", 2 * time.Hour, true},
-		{"a whole day lands back on the start", "09:00", 24 * 60, "09:00", 0, false},
-		{"longer than a day wraps within it", "09:00", 1505, "10:05", 65 * time.Minute, false},
-		{"a negative span is no span", "09:00", -30, "09:00", 0, false},
+		{"a plain span", "2026-08-01", 9, 70, "2026-08-01", 10, 10, 70 * time.Minute},
+		{"no span at all", "2026-08-01", 9, 0, "2026-08-01", 9, 0, 0},
+		{"up to midnight", "2026-08-01", 23, 60, "2026-08-02", 0, 0, time.Hour},
+		{"past midnight", "2026-08-01", 23, 120, "2026-08-02", 1, 0, 2 * time.Hour},
+		{"a whole day lands back on the start", "2026-08-01", 9, 24 * 60, "2026-08-02", 9, 0, 24 * time.Hour},
+		{"negative span becomes zero", "2026-08-01", 9, -30, "2026-08-01", 9, 0, 0},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			item := Item{Content: "记录", Start: mustTime(t, c.start)}
+			start := tsPtrHelper(c.startDate, c.startH, 0)
+			item := Item{Content: "记录", Start: start}
 
 			if !item.AddDuration(c.minutes) {
 				t.Fatalf("AddDuration(%d) = false, want true", c.minutes)
@@ -33,18 +35,18 @@ func TestAddDurationWritesTheEndTime(t *testing.T) {
 			if item.End == nil {
 				t.Fatal("no end time was written")
 			}
-			if got := item.End.String(); got != c.wantEnd {
-				t.Errorf("end = %s, want %s", got, c.wantEnd)
+			if item.End.Year != 2026 || item.End.Month != 8 {
+				t.Errorf("end date = %04d-%02d-%02d, want 2026-08", item.End.Year, item.End.Month, item.End.Day)
 			}
-			dur, crossed := item.Duration()
-			if dur != c.wantDur || crossed != c.wantCrossed {
-				t.Errorf("Duration() = %v, %v; want %v, %v", dur, crossed, c.wantDur, c.wantCrossed)
+			if item.End.Day != parseDay(c.wantEndDate) {
+				t.Errorf("end day = %d, want %d", item.End.Day, parseDay(c.wantEndDate))
 			}
-			if item.Start.String() != c.start {
-				t.Errorf("the start moved to %s, want %s", item.Start, c.start)
+			if item.End.Hour != c.wantEndH || item.End.Minute != c.wantEndM {
+				t.Errorf("end time = %02d:%02d, want %02d:%02d", item.End.Hour, item.End.Minute, c.wantEndH, c.wantEndM)
 			}
-			if item.Content != "记录" {
-				t.Errorf("content = %q, want it left alone", item.Content)
+			dur, _ := item.Duration()
+			if dur != c.wantDur {
+				t.Errorf("Duration() = %v; want %v", dur, c.wantDur)
 			}
 			if item.Start == item.End {
 				t.Error("the new end time shares its pointer with the start time")
@@ -53,14 +55,24 @@ func TestAddDurationWritesTheEndTime(t *testing.T) {
 	}
 }
 
+func parseDay(date string) int {
+	ts, _ := ParseDate(date)
+	if ts == "" {
+		return 0
+	}
+	// date is "2006-01-02", day is last 2 chars
+	return int(ts[8]-'0')*10 + int(ts[9]-'0')
+}
+
 func TestAddDurationWithoutAStartTime(t *testing.T) {
-	item := Item{Content: "还没开始", End: mustTime(t, "18:00")}
+	end := tsPtrHelper("2026-08-01", 18, 0)
+	item := Item{Content: "还没开始", End: end}
 
 	if item.AddDuration(60) {
 		t.Error("AddDuration(60) = true, want false when there is no start to measure from")
 	}
-	if got := item.End.String(); got != "18:00" {
-		t.Errorf("the end time was rewritten to %s, want the row left alone", got)
+	if item.End.Hour != 18 || item.End.Minute != 0 {
+		t.Errorf("the end time was rewritten to %02d:%02d, want the row left alone", item.End.Hour, item.End.Minute)
 	}
 
 	// An end time is not invented either, so the row still reads as no span.
@@ -69,16 +81,11 @@ func TestAddDurationWithoutAStartTime(t *testing.T) {
 		t.Error("AddDuration(60) = true on an empty item, want false")
 	}
 	if bare.End != nil {
-		t.Errorf("end = %s, want it left unset", bare.End)
+		t.Errorf("end = %v, want it left unset", bare.End)
 	}
 }
 
-func mustTime(t *testing.T, s string) *Time {
-	t.Helper()
-
-	tm, ok := ParseTime(s)
-	if !ok {
-		t.Fatalf("ParseTime(%q) = false, want a valid reading", s)
-	}
-	return &tm
+func tsPtrHelper(date string, h, m int) *Timestamp {
+	ts, _ := TimestampFromDateTime(date, h, m)
+	return &ts
 }

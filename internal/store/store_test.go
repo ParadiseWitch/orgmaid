@@ -6,12 +6,34 @@ import (
 	"time"
 )
 
-func timePtr(h, m int) *Time {
-	t := Time{Hour: h, Minute: m}
-	return &t
+func tsPtr(date string, h, m int) *Timestamp {
+	ts, _ := TimestampFromDateTime(date, h, m)
+	return &ts
 }
 
 func TestParseSpecExample(t *testing.T) {
+	input := `* 2026-08-01
+** 日志事项1内容
+   CLOCK: [2026-08-01 六 09:00]--[2026-08-01 六 10:21]
+** 日志事项2内容
+   CLOCK: [2026-08-01 六 10:30]--[2026-08-01 六 11:21]
+`
+
+	got := Parse([]byte(input))
+	want := Journal{Days: []Day{{
+		Date: "2026-08-01",
+		Items: []Item{
+			{Content: "日志事项1内容", Start: tsPtr("2026-08-01", 9, 0), End: tsPtr("2026-08-01", 10, 21)},
+			{Content: "日志事项2内容", Start: tsPtr("2026-08-01", 10, 30), End: tsPtr("2026-08-01", 11, 21)},
+		},
+	}}}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Parse mismatch\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+func TestParseLegacyFormat(t *testing.T) {
 	input := `* 2026-08-01
 ** 日志事项1内容
    - START: 09:00
@@ -25,8 +47,8 @@ func TestParseSpecExample(t *testing.T) {
 	want := Journal{Days: []Day{{
 		Date: "2026-08-01",
 		Items: []Item{
-			{Content: "日志事项1内容", Start: timePtr(9, 0), End: timePtr(10, 21)},
-			{Content: "日志事项2内容", Start: timePtr(10, 30), End: timePtr(11, 21)},
+			{Content: "日志事项1内容", Start: tsPtr("2026-08-01", 9, 0), End: tsPtr("2026-08-01", 10, 21)},
+			{Content: "日志事项2内容", Start: tsPtr("2026-08-01", 10, 30), End: tsPtr("2026-08-01", 11, 21)},
 		},
 	}}}
 
@@ -47,7 +69,7 @@ func TestParseToleratesVariants(t *testing.T) {
 	want := Journal{Days: []Day{{
 		Date: "2026-08-01",
 		Items: []Item{
-			{Content: "内容正常", Start: timePtr(9, 5), End: timePtr(17, 45)},
+			{Content: "内容正常", Start: tsPtr("2026-08-01", 9, 5), End: tsPtr("2026-08-01", 17, 45)},
 			{Content: "只有内容没有时间"},
 		},
 	}}}
@@ -61,11 +83,10 @@ func TestParseRejectsImpossibleValues(t *testing.T) {
 	input := `* 2026-13-40
 ** 日期不存在的段落整体忽略
 * 2026-08-01
-   - START: 09:00
+   CLOCK: [2026-08-01 六 09:00]
 ** 时间字段出现在条目之前，忽略
 ** 非法时间
-   - START: 25:00
-   - END: 10:99
+   CLOCK: [2026-08-01 六 25:00]--[2026-08-01 六 10:99]
 `
 
 	got := Parse([]byte(input))
@@ -122,18 +143,16 @@ func TestSerializeMatchesSpecLayout(t *testing.T) {
 	j := Journal{Days: []Day{{
 		Date: "2026-08-01",
 		Items: []Item{
-			{Content: "日志事项1内容", Start: timePtr(9, 0), End: timePtr(10, 21)},
-			{Content: "日志事项2内容", Start: timePtr(10, 30), End: timePtr(11, 21)},
+			{Content: "日志事项1内容", Start: tsPtr("2026-08-01", 9, 0), End: tsPtr("2026-08-01", 10, 21)},
+			{Content: "日志事项2内容", Start: tsPtr("2026-08-01", 10, 30), End: tsPtr("2026-08-01", 11, 21)},
 		},
 	}}}
 
 	want := `* 2026-08-01
 ** 日志事项1内容
-   - START: 09:00
-   - END: 10:21
+   CLOCK: [2026-08-01 六 09:00]--[2026-08-01 六 10:21]
 ** 日志事项2内容
-   - START: 10:30
-   - END: 11:21
+   CLOCK: [2026-08-01 六 10:30]--[2026-08-01 六 11:21]
 `
 
 	if got := string(j.Serialize()); got != want {
@@ -144,8 +163,8 @@ func TestSerializeMatchesSpecLayout(t *testing.T) {
 func TestSerializeOmitsMissingFields(t *testing.T) {
 	j := Journal{Days: []Day{
 		{Date: "2026-08-01", Items: []Item{
-			{Content: "只有开始", Start: timePtr(9, 0)},
-			{Content: "只有结束", End: timePtr(18, 30)},
+			{Content: "只有开始", Start: tsPtr("2026-08-01", 9, 0)},
+			{Content: "只有结束", End: tsPtr("2026-08-01", 18, 30)},
 			{Content: "都没有"},
 		}},
 		{Date: "2026-08-02"},
@@ -153,9 +172,8 @@ func TestSerializeOmitsMissingFields(t *testing.T) {
 
 	want := `* 2026-08-01
 ** 只有开始
-   - START: 09:00
+   CLOCK: [2026-08-01 六 09:00]
 ** 只有结束
-   - END: 18:30
 ** 都没有
 
 * 2026-08-02
@@ -170,25 +188,21 @@ func TestRoundTripIsStable(t *testing.T) {
 	inputs := []string{
 		`* 2026-08-01
 ** 日志事项1内容
-   - START: 09:00
-   - END: 10:21
+   CLOCK: [2026-08-01 六 09:00]--[2026-08-01 六 10:21]
 ** 日志事项2内容
-   - START: 10:30
-   - END: 11:21
+   CLOCK: [2026-08-01 六 10:30]--[2026-08-01 六 11:21]
 `,
 		`* 2026-08-01
 ** 只有开始
-   - START: 09:00
+   CLOCK: [2026-08-01 六 09:00]
 ** 只有结束
-   - END: 18:30
 ** 都没有
 
 * 2026-08-02
 `,
 		`* 2026-01-01
 ** 跨年
-   - START: 23:00
-   - END: 01:30
+   CLOCK: [2026-01-01 四 23:00]--[2026-01-02 五 01:30]
 `,
 	}
 
@@ -208,16 +222,16 @@ func TestRoundTripIsStable(t *testing.T) {
 func TestDurationCrossesMidnight(t *testing.T) {
 	cases := []struct {
 		name       string
-		start, end *Time
+		start, end *Timestamp
 		want       time.Duration
 		crossed    bool
 		shown      bool
 	}{
-		{"same day", timePtr(9, 0), timePtr(10, 10), 70 * time.Minute, false, true},
-		{"crosses midnight", timePtr(23, 0), timePtr(1, 0), 2 * time.Hour, true, true},
-		{"zero length", timePtr(9, 0), timePtr(9, 0), 0, false, true},
-		{"no start", nil, timePtr(9, 0), 0, false, false},
-		{"no end", timePtr(9, 0), nil, 0, false, false},
+		{"same day", tsPtr("2026-08-01", 9, 0), tsPtr("2026-08-01", 10, 10), 70 * time.Minute, false, true},
+		{"next day is not crossing", tsPtr("2026-08-01", 23, 0), tsPtr("2026-08-02", 1, 0), 2 * time.Hour, false, true},
+		{"same time zero length", tsPtr("2026-08-01", 9, 0), tsPtr("2026-08-01", 9, 0), 0, false, true},
+		{"no start", nil, tsPtr("2026-08-01", 9, 0), 0, false, false},
+		{"no end", tsPtr("2026-08-01", 9, 0), nil, 0, false, false},
 	}
 
 	for _, c := range cases {
@@ -253,11 +267,12 @@ func TestFormatDuration(t *testing.T) {
 
 func TestDayTotals(t *testing.T) {
 	day := Day{Date: "2026-08-01", Items: []Item{
-		{Content: "a", Start: timePtr(9, 0), End: timePtr(10, 0)},
-		{Content: "b", Start: timePtr(23, 0), End: timePtr(1, 0)},
-		{Content: "c", Start: timePtr(14, 0)},
+		{Content: "a", Start: tsPtr("2026-08-01", 9, 0), End: tsPtr("2026-08-01", 10, 0)},
+		{Content: "b", Start: tsPtr("2026-08-01", 23, 0), End: tsPtr("2026-08-02", 1, 0)},
+		{Content: "c", Start: tsPtr("2026-08-01", 14, 0)},
 	}}
 
+	// a = 1h, b = 2h (next day), c = no end
 	if got, want := day.TotalDuration(), 3*time.Hour; got != want {
 		t.Errorf("TotalDuration() = %v, want %v", got, want)
 	}
@@ -317,7 +332,7 @@ func TestSaveAndReload(t *testing.T) {
 	saved := &Store{Path: path}
 	saved.Journal.EnsureDay("2026-08-02")
 	day := saved.Day("2026-08-01")
-	day.Items = append(day.Items, Item{Content: "写入再读回", Start: timePtr(9, 0), End: timePtr(9, 45)})
+	day.Items = append(day.Items, Item{Content: "写入再读回", Start: tsPtr("2026-08-01", 9, 0), End: tsPtr("2026-08-01", 9, 45)})
 
 	if err := saved.Save(); err != nil {
 		t.Fatalf("Save: %v", err)

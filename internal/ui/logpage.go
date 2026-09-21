@@ -15,9 +15,8 @@ import (
 	"orgmaid/internal/store"
 )
 
-// A row's cursor sits on one of eight stops. The three measured columns each
-// split into an hour and a minute, so walking from the index to the content
-// costs seven presses of Tab.
+// A row's cursor sits on one of eleven stops. The visual order is:
+// index, todo, start, end, duration, content, scheduled, deadline
 const (
 	fIndex = iota
 	fTodo
@@ -28,13 +27,15 @@ const (
 	fDurHour
 	fDurMinute
 	fContent
+	fScheduled
+	fDeadline
 	stopCount
 )
 
 // stopNames labels every stop for the key-hint bar.
 var stopNames = [stopCount]string{
 	"序号", "待办", "开始 小时", "开始 分钟", "结束 小时", "结束 分钟",
-	"耗时 小时", "耗时 分钟", "内容",
+	"耗时 小时", "耗时 分钟", "内容", "计划", "截止",
 }
 
 // hourStop reports whether a stop is the hour half of its column. The stops come
@@ -44,10 +45,15 @@ func hourStop(field int) bool {
 	return field == fStartHour || field == fEndHour || field == fDurHour
 }
 
-// timeStop reports whether a stop takes typed digits. The index, todo, and content
+// dateStop reports whether a stop takes date input (MMDD format).
+func dateStop(field int) bool {
+	return field == fScheduled || field == fDeadline
+}
+
+// timeStop reports whether a stop takes typed digits. The index, todo, date, and content
 // leave digits to the jump machine instead.
 func timeStop(field int) bool {
-	return field > fTodo && field < fContent
+	return field >= fStartHour && field <= fDurMinute
 }
 
 type logState struct {
@@ -63,9 +69,17 @@ type logState struct {
 	// ones, so two presses fill one reading.
 	tensNext bool
 
+	// digitCount tracks how many digits have been typed on a date stop (0-4 for MMDD).
+	digitCount int
+
 	// Tag editing state
 	tagEditing bool
 	tagEditor  textinput.Model
+
+	// Picker popup for SCHEDULED/DEADLINE editing
+	pickerOpen  bool
+	picker      *Picker
+	pickerField int // which stop opened the picker (fScheduled or fDeadline)
 }
 
 // newLogState starts on the content stop, which is where a row is read from and
@@ -82,6 +96,8 @@ func (a *App) updateLog(k tea.KeyMsg) tea.Cmd {
 	a.status = ""
 
 	switch {
+	case a.log.pickerOpen:
+		return a.updatePicker(k)
 	case a.log.tagEditing:
 		return a.updateTagEdit(k)
 	case a.log.editing:
@@ -91,6 +107,73 @@ func (a *App) updateLog(k tea.KeyMsg) tea.Cmd {
 	default:
 		return a.updateLogContent(k)
 	}
+}
+
+// updatePicker handles keys when the date/time picker popup is open.
+func (a *App) updatePicker(k tea.KeyMsg) tea.Cmd {
+	l := &a.log
+	handled, done := l.picker.Update(k)
+
+	if done {
+		// User confirmed - write the selected time back
+		item := a.focusItem()
+		if item != nil {
+			ts := l.picker.SelectedTime()
+			if l.pickerField == fScheduled {
+				item.Scheduled = &ts
+			} else {
+				item.Deadline = &ts
+			}
+			a.save()
+		}
+		l.pickerOpen = false
+		return nil
+	}
+
+	if handled {
+		return nil
+	}
+
+	// Keys the picker didn't handle
+	switch k.Type {
+	case tea.KeyEsc:
+		l.pickerOpen = false
+		return nil
+	case tea.KeyCtrlC:
+		return tea.Quit
+	}
+	return nil
+}
+
+// openPicker opens the date/time picker popup for editing SCHEDULED or DEADLINE.
+func (a *App) openPicker(field int) tea.Cmd {
+	l := &a.log
+	item := a.focusItem()
+	if item == nil {
+		return nil
+	}
+
+	var ts *store.Timestamp
+	if field == fScheduled {
+		ts = item.Scheduled
+	} else {
+		ts = item.Deadline
+	}
+
+	date := a.date
+	hour, minute := 0, 0
+	if ts != nil {
+		date = ts.DateString()
+		hour = ts.Hour
+		minute = ts.Minute
+	}
+
+	l.picker = NewPicker(date, PickDateTime, nil)
+	l.picker.SetTime(hour, minute)
+	l.picker.Init(a.width-4, a.height-4)
+	l.pickerOpen = true
+	l.pickerField = field
+	return nil
 }
 
 func (a *App) updateLogContent(k tea.KeyMsg) tea.Cmd {
@@ -123,6 +206,13 @@ func (a *App) contentKey(k tea.KeyMsg) tea.Cmd {
 		}
 		if r == '0' {
 			return a.selectStop(fIndex)
+		}
+		// h/l navigate between stops like shift+tab/tab
+		if r == 'h' {
+			return a.stepStop(-1)
+		}
+		if r == 'l' {
+			return a.stepStop(1)
 		}
 		cmd, _ := a.rowCommand(r)
 		return cmd
@@ -186,6 +276,8 @@ func (a *App) rowCommand(r rune) (tea.Cmd, bool) {
 		a.gotoItem(len(a.items()) - 1)
 	case 'y':
 		a.copyItem()
+	case 'Y':
+		a.copyDay()
 	case 'p':
 		a.pasteItem()
 	case 'c':
@@ -194,6 +286,10 @@ func (a *App) rowCommand(r rune) (tea.Cmd, bool) {
 		a.cycleTodo()
 	case 'T':
 		a.openTodos()
+	case 'S':
+		return a.setDateStop(fScheduled, a.date), true
+	case 'D':
+		return a.setDateStop(fDeadline, a.date), true
 	case ',':
 		return a.editTags(), true
 	case 'q':
@@ -217,6 +313,13 @@ func (a *App) updateLogStop(k tea.KeyMsg) tea.Cmd {
 	if timeStop(l.field) {
 		if r, ok := keys.SingleRune(k); ok && r >= '0' && r <= '9' {
 			return a.typeDigit(int(r - '0'))
+		}
+	}
+
+	// Date stops take MMDD input
+	if dateStop(l.field) {
+		if r, ok := keys.SingleRune(k); ok && r >= '0' && r <= '9' {
+			return a.typeDateDigit(int(r - '0'))
 		}
 	}
 
@@ -250,6 +353,23 @@ func (a *App) stopKey(k tea.KeyMsg) tea.Cmd {
 		if r == 's' {
 			return a.setNow()
 		}
+		if r == 'x' {
+			return a.clearTime()
+		}
+		// S sets SCHEDULED to today, D sets DEADLINE to today
+		if r == 'S' {
+			return a.setDateStop(fScheduled, a.date)
+		}
+		if r == 'D' {
+			return a.setDateStop(fDeadline, a.date)
+		}
+		// h/l navigate between stops like shift+tab/tab
+		if r == 'h' {
+			return a.stepStop(-1)
+		}
+		if r == 'l' {
+			return a.stepStop(1)
+		}
 		cmd, _ := a.rowCommand(r)
 		return cmd
 	}
@@ -261,14 +381,22 @@ func (a *App) stopKey(k tea.KeyMsg) tea.Cmd {
 			a.cycleTodo()
 			return nil
 		}
+		if dateStop(a.log.field) {
+			// Open picker popup for date/time selection
+			return a.openPicker(a.log.field)
+		}
 		if measured {
 			return a.adjustStop(1)
 		}
 		a.moveItem(-1)
 	case tea.KeyDown:
 		if a.log.field == fTodo {
-			a.cycleTodo()
+			a.cycleTodoReverse()
 			return nil
+		}
+		if dateStop(a.log.field) {
+			// Open picker popup for date/time selection
+			return a.openPicker(a.log.field)
 		}
 		if measured {
 			return a.adjustStop(-1)
@@ -295,6 +423,7 @@ func (a *App) selectStop(field int) tea.Cmd {
 	l.field = field
 	l.machine.Reset()
 	l.tensNext = true
+	l.digitCount = 0
 	return nil
 }
 
@@ -370,16 +499,20 @@ func (a *App) putStop(item *store.Item, value int) bool {
 }
 
 // clockSlot is the reading a start or end stop writes to. An empty one is
-// created at 00:00, which is what the cursor then steps away from.
-func (a *App) clockSlot(item *store.Item) *store.Time {
+// created at 00:00 on the current date, which is what the cursor then steps
+// away from.
+func (a *App) clockSlot(item *store.Item) *store.Timestamp {
+	date := a.date
 	if a.log.field == fEndHour || a.log.field == fEndMinute {
 		if item.End == nil {
-			item.End = &store.Time{}
+			ts, _ := store.TimestampFromDateTime(date, 0, 0)
+			item.End = &ts
 		}
 		return item.End
 	}
 	if item.Start == nil {
-		item.Start = &store.Time{}
+		ts, _ := store.TimestampFromDateTime(date, 0, 0)
+		item.Start = &ts
 	}
 	return item.Start
 }
@@ -433,18 +566,175 @@ func (a *App) setNow() tea.Cmd {
 		return nil
 	}
 
+	now := store.NowTimestamp()
+	// Use the date being viewed, not today
+	ts, _ := store.TimestampFromDateTime(a.date, now.Hour, now.Minute)
+
 	switch l.field {
 	case fStartHour, fStartMinute:
-		now := store.NowTime()
-		item.Start = &now
+		item.Start = &ts
 	case fEndHour, fEndMinute:
-		now := store.NowTime()
-		item.End = &now
+		item.End = &ts
 	default:
 		return nil
 	}
 
 	l.tensNext = true
+	a.save()
+	return nil
+}
+
+// clearTime is the x key: it removes the start or end time the cursor stands on.
+// The duration stops have no time of their own, so the key is inert there.
+func (a *App) clearTime() tea.Cmd {
+	item := a.focusItem()
+	if item == nil {
+		return nil
+	}
+
+	switch a.log.field {
+	case fStartHour, fStartMinute:
+		item.Start = nil
+	case fEndHour, fEndMinute:
+		item.End = nil
+	case fScheduled:
+		item.Scheduled = nil
+	case fDeadline:
+		item.Deadline = nil
+	default:
+		return nil
+	}
+
+	a.log.tensNext = true
+	a.save()
+	return nil
+}
+
+// dateSlot returns the Timestamp pointer for a date stop, creating one if needed.
+func (a *App) dateSlot(item *store.Item) **store.Timestamp {
+	if a.log.field == fDeadline {
+		return &item.Deadline
+	}
+	return &item.Scheduled
+}
+
+// setDateStop sets a date stop to the given date string.
+func (a *App) setDateStop(field int, date string) tea.Cmd {
+	l := &a.log
+	item := a.focusItem()
+	if item == nil {
+		return nil
+	}
+
+	// Only work on date stops
+	if field != fScheduled && field != fDeadline {
+		return nil
+	}
+
+	ts, ok := store.TimestampFromDateOnly(date)
+	if !ok {
+		return nil
+	}
+
+	if field == fScheduled {
+		item.Scheduled = &ts
+	} else {
+		item.Deadline = &ts
+	}
+
+	l.tensNext = true
+	a.save()
+	return nil
+}
+
+// typeDateDigit handles digit input on date stops (MMDD format).
+func (a *App) typeDateDigit(d int) tea.Cmd {
+	l := &a.log
+	item := a.focusItem()
+	if item == nil {
+		return nil
+	}
+
+	slot := a.dateSlot(item)
+	if *slot == nil {
+		ts, _ := store.TimestampFromDateOnly(a.date)
+		*slot = &ts
+	}
+
+	ts := *slot
+	// MMDD input: first two digits are month, next two are day
+	// We accumulate digits in tensNext order
+	switch {
+	case l.tensNext:
+		// First digit of month (tens)
+		if d > 1 {
+			a.status = "月份十位最大为1"
+			return nil
+		}
+		ts.Month = d*10 + ts.Month%10
+	case l.digitCount == 1:
+		// Second digit of month (ones)
+		month := ts.Month/10*10 + d
+		if month < 1 || month > 12 {
+			a.status = "月份需在1-12之间"
+			return nil
+		}
+		ts.Month = month
+	case l.digitCount == 2:
+		// First digit of day (tens)
+		if d > 3 {
+			a.status = "日期十位最大为3"
+			return nil
+		}
+		ts.Day = d*10 + ts.Day%10
+	case l.digitCount == 3:
+		// Second digit of day (ones)
+		day := ts.Day/10*10 + d
+		if day < 1 || day > 31 {
+			a.status = "日期需在1-31之间"
+			return nil
+		}
+		ts.Day = day
+		// Validate the full date
+		testDate := fmt.Sprintf("%04d-%02d-%02d", ts.Year, ts.Month, day)
+		if _, err := time.Parse(store.DateLayout, testDate); err != nil {
+			a.status = "无效日期"
+			return nil
+		}
+		l.digitCount = 0
+		l.tensNext = true
+		*slot = ts
+		a.save()
+		return nil
+	}
+
+	l.tensNext = false
+	l.digitCount++
+	*slot = ts
+	return nil
+}
+
+// adjustDate moves the date on a date stop by delta days.
+func (a *App) adjustDate(delta int) tea.Cmd {
+	item := a.focusItem()
+	if item == nil {
+		return nil
+	}
+
+	slot := a.dateSlot(item)
+	if *slot == nil {
+		ts, _ := store.TimestampFromDateOnly(a.date)
+		*slot = &ts
+	}
+
+	ts := *slot
+	t := ts.ToTime().AddDate(0, 0, delta)
+	newTs := store.Timestamp{
+		Year:  t.Year(),
+		Month: int(t.Month()),
+		Day:   t.Day(),
+	}
+	*slot = &newTs
 	a.save()
 	return nil
 }
@@ -529,22 +819,23 @@ func (a *App) insertBelow() tea.Cmd {
 	}
 
 	day := a.editableDay()
-	now := store.NowTime()
+	now := store.NowTimestamp()
+	ts, _ := store.TimestampFromDateTime(a.date, now.Hour, now.Minute)
 
 	// The new item starts now, so the one above it — the task logged until this
 	// moment — stops now too, if it never got an end of its own. It gets its own
-	// copy of the reading: one *store.Time shared by two items would let editing
-	// either of them move the other.
+	// copy of the reading: one *store.Timestamp shared by two items would let
+	// editing either of them move the other.
 	if at > 0 {
 		if prev := &day.Items[at-1]; prev.Start != nil && prev.End == nil {
-			stop := now
+			stop := ts
 			prev.End = &stop
 		}
 	}
 
 	day.Items = append(day.Items, store.Item{})
 	copy(day.Items[at+1:], day.Items[at:])
-	day.Items[at] = store.Item{Start: &now}
+	day.Items[at] = store.Item{Start: &ts}
 	a.save()
 
 	a.log.cursor = at
@@ -591,11 +882,58 @@ func (a *App) copyItem() {
 	clone := items[i].Clone()
 	a.log.clipboard = &clone
 
-	// Copy content to system clipboard
-	if err := clipboard.WriteAll(clone.Content); err != nil {
+	// Format item as org-mode text
+	text := formatItem(clone)
+
+	// Copy to system clipboard
+	if err := clipboard.WriteAll(text); err != nil {
 		a.status = "已复制第 " + strconv.Itoa(i+1) + " 项（剪贴板写入失败）"
 	} else {
 		a.status = "已复制第 " + strconv.Itoa(i+1) + " 项到剪贴板"
+	}
+}
+
+// formatItem renders a single item in org-mode format.
+func formatItem(it store.Item) string {
+	var b strings.Builder
+	b.WriteString("** ")
+	if it.Todo != "" {
+		b.WriteString(it.Todo)
+		b.WriteByte(' ')
+	}
+	b.WriteString(it.Content)
+	if len(it.Tags) > 0 {
+		b.WriteString("  :")
+		b.WriteString(strings.Join(it.Tags, ":"))
+		b.WriteString(":")
+	}
+	b.WriteByte('\n')
+	if it.Start != nil {
+		fmt.Fprintf(&b, "   - START: %s\n", it.Start)
+	}
+	if it.End != nil {
+		fmt.Fprintf(&b, "   - END: %s\n", it.End)
+	}
+	return b.String()
+}
+
+func (a *App) copyDay() {
+	day := a.day()
+	if day == nil || len(day.Items) == 0 {
+		a.status = "当日无记录"
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "* %s\n", day.Date)
+	for _, it := range day.Items {
+		b.WriteString(formatItem(it))
+	}
+
+	if err := clipboard.WriteAll(b.String()); err != nil {
+		a.status = "已复制当日记录（剪贴板写入失败）"
+	} else {
+		a.status = "已复制当日 " + strconv.Itoa(len(day.Items)) + " 项记录到剪贴板"
 	}
 }
 
@@ -625,6 +963,26 @@ func (a *App) cycleTodo() {
 		item.Todo = "DONE"
 		a.status = "标记为完成"
 	case "DONE":
+		item.Todo = ""
+		a.status = "取消标记"
+	}
+	a.save()
+}
+
+// cycleTodoReverse cycles the TODO state in reverse: "" → "DONE" → "TODO" → "".
+func (a *App) cycleTodoReverse() {
+	item := a.focusItem()
+	if item == nil {
+		return
+	}
+	switch item.Todo {
+	case "":
+		item.Todo = "DONE"
+		a.status = "标记为完成"
+	case "DONE":
+		item.Todo = "TODO"
+		a.status = "标记为待办"
+	case "TODO":
 		item.Todo = ""
 		a.status = "取消标记"
 	}
@@ -752,13 +1110,70 @@ func (a *App) viewLog() string {
 		rows = append(rows, "")
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	base := lipgloss.JoinVertical(lipgloss.Left,
 		a.renderTitle(),
 		divider(a.width),
 		lipgloss.JoinVertical(lipgloss.Left, rows...),
 		divider(a.width),
 		a.renderStatus(),
 	)
+
+	// Overlay picker popup if open
+	if a.log.pickerOpen && a.log.picker != nil {
+		return a.overlayPicker(base)
+	}
+
+	return base
+}
+
+// overlayPicker draws the picker popup centered on the screen.
+func (a *App) overlayPicker(base string) string {
+	p := a.log.picker
+	popupWidth := 32
+	popupHeight := a.height - 4
+	if popupHeight < 15 {
+		popupHeight = 15
+	}
+	p.Init(popupWidth, popupHeight)
+
+	popup := p.View()
+
+	// Wrap popup in a border
+	borderStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(fg(pal.Divider)).
+		Padding(1, 2)
+
+	popup = borderStyle.Render(popup)
+
+	// Center the popup
+	popupLines := strings.Split(popup, "\n")
+	popupW := lipgloss.Width(popup)
+	popupH := len(popupLines)
+
+	leftPad := (a.width - popupW) / 2
+	if leftPad < 0 {
+		leftPad = 0
+	}
+	topPad := (a.height - popupH) / 2
+	if topPad < 0 {
+		topPad = 0
+	}
+
+	// Build the overlay
+	baseLines := strings.Split(base, "\n")
+	for len(baseLines) < a.height {
+		baseLines = append(baseLines, "")
+	}
+
+	// Overlay the popup onto the base
+	for i := 0; i < popupH && topPad+i < len(baseLines); i++ {
+		line := popupLines[i]
+		paddedLine := strings.Repeat(" ", leftPad) + line
+		baseLines[topPad+i] = paddedLine
+	}
+
+	return strings.Join(baseLines, "\n")
 }
 
 func (a *App) emptyRow() string {
@@ -794,15 +1209,66 @@ func (a *App) renderRow(i int, it store.Item) string {
 		mark = "\uf0da"
 	}
 
+	// Render base row with all cells at compact width
+	contentWidth := a.contentWidth()
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+
 	row := cell(mark, colMark, lipgloss.Left, fg(pal.Warn), ground) +
 		lipgloss.JoinHorizontal(lipgloss.Top,
 			a.indexCell(i+1, ground, focus == fIndex),
-			a.todoCell(it.Todo, ground, focus == fTodo),
+			a.todoCell(it.Todo, ground, false),
 			a.clockCell(it.Start, fg(pal.Start), ground, focus == fStartHour, focus == fStartMinute, " -")+
 				a.clockCell(it.End, fg(pal.End), ground, focus == fEndHour, focus == fEndMinute, "  "),
 			a.durationCell(it, ground, focus == fDurHour, focus == fDurMinute),
-			a.contentCell(it, ground, selected, selected && l.editing),
+			a.contentCell(it, ground, selected, selected && l.editing, contentWidth),
+			a.schedCell(it.Scheduled, ground, false),
+			a.deadCell(it.Deadline, ground, false),
 		)
+
+	// Overlay expanded cell if needed
+	// Calculate x-positions: mark(2) + index(3) + todo(2) + start(8) + end(8) + duration(8) = 31
+	// content starts at 31, sched after content, dead after sched
+	xTodo := colMark + colIndex // TODO starts after mark and index
+	xSched := colMark + colIndex + colTodo + colTime*2 + colDuration + contentWidth
+	xDead := xSched + colSched
+
+	switch focus {
+	case fTodo:
+		// Only expand if TODO is not empty
+		if it.Todo != "" {
+			expanded := a.todoCell(it.Todo, ground, true)
+			row = overlay(row, expanded, xTodo)
+		}
+	case fScheduled:
+		expanded := a.schedCell(it.Scheduled, ground, true)
+		// Expand backward if would exceed screen width
+		x := xSched
+		if xSched+expandedDate > a.width {
+			x = xSched - (expandedDate - colSched)
+			if x < 0 {
+				x = 0
+			}
+		}
+		row = overlay(row, expanded, x)
+	case fDeadline:
+		expanded := a.deadCell(it.Deadline, ground, true)
+		// Expand backward if would exceed screen width
+		x := xDead
+		if xDead+expandedDate > a.width {
+			x = xDead - (expandedDate - colDead)
+			if x < 0 {
+				x = 0
+			}
+		}
+		row = overlay(row, expanded, x)
+	case fContent:
+		// Highlight content area with bold text
+		highlighted := a.contentCellHighlighted(it, ground, selected, selected && l.editing, contentWidth)
+		xContent := colMark + colIndex + colTodo + colTime*2 + colDuration
+		row = overlay(row, highlighted, xContent)
+	}
 
 	return cut(row, a.width)
 }
@@ -815,37 +1281,94 @@ func (a *App) indexCell(n int, ground lipgloss.TerminalColor, active bool) strin
 		choose(active, bg(pal.Field), ground))
 }
 
-// todoCell shows the TODO/DONE status in its own column.
+// todoCell shows the TODO/DONE status in a compact column.
+// Compact: " T " for TODO, " D " for DONE, empty otherwise.
+// Expanded (when focused): shows " TODO " or " DONE " with space separators.
 func (a *App) todoCell(todo string, ground lipgloss.TerminalColor, active bool) string {
-	text := ""
-	col := fg(pal.Dim)
-	var todoBg lipgloss.TerminalColor = ground
+	if todo == "" {
+		// Empty todo state
+		if active {
+			return todoExpandable.RenderEmptyExpanded()
+		}
+		return todoExpandable.RenderEmptyCompact(ground)
+	}
+
+	var text, compact string
+	var col lipgloss.TerminalColor
+	var normalBg lipgloss.TerminalColor
+
 	switch todo {
 	case "TODO":
-		text = "TODO"
+		text = " TODO "
+		compact = " T "
 		col = fg(pal.Ink)
-		if active {
-			todoBg = bg(pal.Start)
-		} else {
-			todoBg = bg("#5b8abf")
-		}
+		normalBg = bg("#5b8abf")
 	case "DONE":
-		text = "DONE"
+		text = " DONE "
+		compact = " D "
 		col = fg(pal.Ink)
-		if active {
-			todoBg = bg(pal.Crossed)
-		} else {
-			todoBg = bg("#6aaa7a")
-		}
-	default:
-		return cell("      ", colTodo, lipgloss.Center, col, ground)
+		normalBg = bg("#6aaa7a")
 	}
-	// Render the text with background, then pad to column width
-	styled := lipgloss.NewStyle().
-		Foreground(col).
-		Background(todoBg).
-		Render(text)
-	return cell(styled, colTodo, lipgloss.Center, fg(pal.Text), ground)
+
+	if active {
+		// Expanded view - use the area's own color (normalBg) with space separators
+		return todoExpandable.RenderExpanded(text, col, normalBg)
+	}
+
+	// Compact view
+	return todoExpandable.RenderCompact(compact, col, normalBg, ground)
+}
+
+// schedCell shows SCHEDULED in a compact column.
+// Compact: " S " if set, empty otherwise.
+// Expanded (when focused): shows " S: 2026-09-21 09:30 " with space separators.
+func (a *App) schedCell(ts *store.Timestamp, ground lipgloss.TerminalColor, active bool) string {
+	if ts == nil {
+		if active {
+			styled := lipgloss.NewStyle().
+				Foreground(fg(pal.Start)).
+				Background(bg(pal.Start)).
+				Bold(true).
+				Render(" S: -- ")
+			return schedExpandable.RenderExpanded(styled, fg(pal.Start), bg(pal.Start))
+		}
+		return schedExpandable.RenderEmptyCompact(ground)
+	}
+
+	if active {
+		// Expanded view: " S: 2026-09-21 09:30 "
+		text := fmt.Sprintf(" S: %s %02d:%02d ", ts.DateString(), ts.Hour, ts.Minute)
+		return schedExpandable.RenderExpanded(text, fg(pal.Ink), bg(pal.Start))
+	}
+
+	// Compact view
+	return schedExpandable.RenderCompact(" S ", fg(pal.Start), ground, ground)
+}
+
+// deadCell shows DEADLINE in a compact column.
+// Compact: " D " if set, empty otherwise.
+// Expanded (when focused): shows " D: 2026-09-21 09:30 " with space separators.
+func (a *App) deadCell(ts *store.Timestamp, ground lipgloss.TerminalColor, active bool) string {
+	if ts == nil {
+		if active {
+			styled := lipgloss.NewStyle().
+				Foreground(fg(pal.Crossed)).
+				Background(bg(pal.Crossed)).
+				Bold(true).
+				Render(" D: -- ")
+			return deadExpandable.RenderExpanded(styled, fg(pal.Crossed), bg(pal.Crossed))
+		}
+		return deadExpandable.RenderEmptyCompact(ground)
+	}
+
+	if active {
+		// Expanded view: " D: 2026-09-21 09:30 "
+		text := fmt.Sprintf(" D: %s %02d:%02d ", ts.DateString(), ts.Hour, ts.Minute)
+		return deadExpandable.RenderExpanded(text, fg(pal.Ink), bg(pal.Crossed))
+	}
+
+	// Compact view
+	return deadExpandable.RenderCompact(" D ", fg(pal.Crossed), ground, ground)
 }
 
 // clockCell is one of the two time columns: the reading in its own accent with a
@@ -853,7 +1376,7 @@ func (a *App) todoCell(todo string, ground lipgloss.TerminalColor, active bool) 
 // block. An unset clock is a placeholder rather than a reading, so it takes the
 // secondary colour; the block still lands on the half the cursor is on, because
 // an empty clock is as fillable as a full one.
-func (a *App) clockCell(t *store.Time, accent, ground lipgloss.TerminalColor, hourActive, minuteActive bool, trail string) string {
+func (a *App) clockCell(t *store.Timestamp, accent, ground lipgloss.TerminalColor, hourActive, minuteActive bool, trail string) string {
 	ink := accent
 	if t == nil {
 		ink = fg(pal.Dim)
@@ -861,8 +1384,8 @@ func (a *App) clockCell(t *store.Time, accent, ground lipgloss.TerminalColor, ho
 
 	hour, sep, minute := "--", ":", "--"
 	if t != nil {
-		text := t.String()
-		hour, sep, minute = text[0:2], text[2:3], text[3:5]
+		hour = fmt.Sprintf("%02d", t.Hour)
+		minute = fmt.Sprintf("%02d", t.Minute)
 	}
 
 	return run(" ", ink, ground) +
@@ -901,9 +1424,7 @@ func (a *App) durationCell(it store.Item, ground lipgloss.TerminalColor, hourAct
 // accents quiet: it is what the day is read for. A row the cursor is on lifts it
 // to the brighter of the two text colours, the editor takes over while it is
 // open, and a row with nothing logged says so in the secondary colour.
-func (a *App) contentCell(it store.Item, ground lipgloss.TerminalColor, selected, editing bool) string {
-	width := a.contentWidth()
-
+func (a *App) contentCell(it store.Item, ground lipgloss.TerminalColor, selected, editing bool, width int) string {
 	col := fg(pal.Text)
 	switch {
 	case editing:
@@ -934,6 +1455,47 @@ func (a *App) contentCell(it store.Item, ground lipgloss.TerminalColor, selected
 	}
 
 	return cell(text, width, lipgloss.Left, col, ground)
+}
+
+// contentCellHighlighted renders the content cell with bold text for highlighting
+func (a *App) contentCellHighlighted(it store.Item, ground lipgloss.TerminalColor, selected, editing bool, width int) string {
+	col := fg(pal.Text)
+	switch {
+	case editing:
+		col = fg(pal.Editing)
+	case it.Content == "":
+		col = fg(pal.Dim)
+	case selected:
+		col = fg(pal.Selected)
+	}
+
+	if editing {
+		return lipgloss.NewStyle().
+			Width(width).
+			Foreground(col).
+			Background(ground).
+			Bold(true).
+			Render(a.log.editor.View())
+	}
+
+	text := it.Content
+	if text == "" {
+		text = "（无内容）"
+	}
+
+	// Append tags in dim color
+	if len(it.Tags) > 0 {
+		tagStr := "  :" + strings.Join(it.Tags, ":") + ":"
+		text += tagStr
+	}
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Align(lipgloss.Left).
+		Foreground(col).
+		Background(ground).
+		Bold(true).
+		Render(fit(text, width))
 }
 
 func (a *App) renderTitle() string {
@@ -982,17 +1544,23 @@ func (a *App) stopHints() string {
 		return "\uf0cb 序号 j/k 换项 J/K 挪本项 Tab 换列 ? 帮助 Esc 回内容"
 	case fTodo:
 		return "\uf0ae 待办 ↑/↓ 切换状态 Tab 换列 Esc 回内容"
+	case fScheduled:
+		return "\uf073 计划 ↑/↓ 打开日期选择器 s 今天 x 清空 Tab 换列 Esc 回内容"
+	case fDeadline:
+		return "\uf073 截止 ↑/↓ 打开日期选择器 s 今天 x 清空 Tab 换列 Esc 回内容"
 	}
 
 	// The clock stops take one half of a reading at a time and can be filled from
 	// the clock; the span stops own no reading at all, so a digit there lands on
 	// the end time and s has nothing to fill.
-	step, digits := "每次 5", "十位→个位 s 现在"
+	step, digits := "每次 5", "s 现在"
 	if hourStop(l.field) {
 		step = "每次 1"
 	}
 	if l.field == fDurHour || l.field == fDurMinute {
 		digits = "写回结束时间"
+	} else {
+		digits += " x 清空"
 	}
 
 	return name + " | ↑ 加 ↓ 减 " + step + " 循环 | 数字 " + digits +

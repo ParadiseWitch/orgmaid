@@ -30,13 +30,29 @@ func (j Journal) Serialize() []byte {
 				b.WriteString(":")
 			}
 			b.WriteByte('\n')
-			if item.Start != nil || item.End != nil {
-				if item.Start != nil {
-					fmt.Fprintf(&b, "   - START: %s\n", item.Start)
-				}
+			// SCHEDULED
+			if item.Scheduled != nil {
+				b.WriteString("   SCHEDULED: <")
+				b.WriteString(item.Scheduled.String())
+				b.WriteString(">\n")
+			}
+			// DEADLINE
+			if item.Deadline != nil {
+				b.WriteString("   DEADLINE: <")
+				b.WriteString(item.Deadline.String())
+				b.WriteString(">\n")
+			}
+			// CLOCK
+			if item.Start != nil {
+				b.WriteString("   CLOCK: [")
+				b.WriteString(item.Start.String())
+				b.WriteString("]")
 				if item.End != nil {
-					fmt.Fprintf(&b, "   - END: %s\n", item.End)
+					b.WriteString("--[")
+					b.WriteString(item.End.String())
+					b.WriteString("]")
 				}
+				b.WriteByte('\n')
 			}
 		}
 	}

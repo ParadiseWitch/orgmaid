@@ -10,7 +10,14 @@ import (
 var (
 	dateHeaderRe = regexp.MustCompile(`^\* ([0-9]{4}-[0-9]{2}-[0-9]{2})$`)
 	itemRe       = regexp.MustCompile(`^\*\* (?:(TODO|DONE) )?(.*?)(\s+:[a-zA-Z0-9_]+(?::[a-zA-Z0-9_]+)*:)?$`)
-	fieldRe      = regexp.MustCompile(`(?i)^   - (START|END)\s*:\s*([0-9]{1,2}:[0-9]{2})\s*$`)
+	// CLOCK: [2026-09-18 四 09:00]--[2026-09-18 四 10:30]
+	clockRe = regexp.MustCompile(`^\s+CLOCK:\s*\[([^\]]+)\](?:--\[([^\]]+)\])?\s*$`)
+	// SCHEDULED: <2026-09-21 六>
+	scheduledRe = regexp.MustCompile(`^\s+SCHEDULED:\s*<([^>]+)>\s*$`)
+	// DEADLINE: <2026-09-22 日>
+	deadlineRe = regexp.MustCompile(`^\s+DEADLINE:\s*<([^>]+)>\s*$`)
+	// Legacy format: - START: 09:00 / - END: 10:30
+	fieldRe = regexp.MustCompile(`(?i)^   - (START|END)\s*:\s*([0-9]{1,2}:[0-9]{2})\s*$`)
 )
 
 // ParseDate normalises a compact or dashed date to DateLayout.
@@ -59,16 +66,56 @@ func Parse(data []byte) Journal {
 			continue
 		}
 
-		if m := fieldRe.FindStringSubmatch(line); m != nil && itemIdx >= 0 {
+		if itemIdx < 0 {
+			continue
+		}
+
+		item := &j.Days[dayIdx].Items[itemIdx]
+		date := j.Days[dayIdx].Date
+
+		// Try CLOCK format first
+		if m := clockRe.FindStringSubmatch(line); m != nil {
+			if start, ok := ParseTimestamp(m[1]); ok {
+				item.Start = &start
+			}
+			if m[2] != "" {
+				if end, ok := ParseTimestamp(m[2]); ok {
+					item.End = &end
+				}
+			}
+			continue
+		}
+
+		// Try SCHEDULED
+		if m := scheduledRe.FindStringSubmatch(line); m != nil {
+			if ts, ok := ParseTimestamp(m[1]); ok {
+				item.Scheduled = &ts
+			}
+			continue
+		}
+
+		// Try DEADLINE
+		if m := deadlineRe.FindStringSubmatch(line); m != nil {
+			if ts, ok := ParseTimestamp(m[1]); ok {
+				item.Deadline = &ts
+			}
+			continue
+		}
+
+		// Fall back to legacy START/END format
+		if m := fieldRe.FindStringSubmatch(line); m != nil {
 			t, ok := ParseTime(m[2])
 			if !ok || !t.Valid() {
 				continue
 			}
-			item := &j.Days[dayIdx].Items[itemIdx]
+			ts, ok := TimestampFromDate(date, t)
+			if !ok {
+				continue
+			}
 			if strings.EqualFold(m[1], "START") {
-				item.Start = &t
+				item.Start = &ts
 			} else {
-				item.End = &t
+				item.End = &ts
 			}
 		}
 	}
