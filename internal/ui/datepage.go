@@ -24,8 +24,8 @@ type dateState struct {
 	search    textinput.Model
 
 	// Calendar view - now uses the Picker component
-	calMode   bool   // true = calendar view, false = list view
-	picker    *Picker
+	calMode bool // true = calendar view, false = list view
+	picker  *Picker
 }
 
 func newDateState() dateState {

@@ -29,15 +29,15 @@ const (
 // expandedWidth is how wide a column gets when focused. The focused column
 // overlaps the content area to show its full detail.
 const (
-	expandedTodo = 6 // " TODO " or " DONE " (with space separators)
+	expandedTodo = 6  // " TODO " or " DONE " (with space separators)
 	expandedDate = 21 // " S: 2026-09-21 09:30 " or " D: 2026-09-21 09:30 " (with space separators)
 )
 
 // expandableCells are reusable components for columns that can expand.
 var (
-	todoExpandable = NewExpandableCell(colTodo, expandedTodo)
+	todoExpandable  = NewExpandableCell(colTodo, expandedTodo)
 	schedExpandable = NewExpandableCell(colSched, expandedDate)
-	deadExpandable = NewExpandableCell(colDead, expandedDate)
+	deadExpandable  = NewExpandableCell(colDead, expandedDate)
 )
 
 // pal is the live palette: the shipped defaults until Apply reads the user's
